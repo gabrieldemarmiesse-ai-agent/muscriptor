@@ -80,6 +80,25 @@ uvx muscriptor transcribe path/to/audio_file.wav
 
 See `--help` for all the options.
 
+### Tempo and quantization
+
+The tempo, time signature and bar lines are detected from the audio and written into the MIDI.
+When the detection is off, or the recording has no steady tempo, you can set them yourself, and
+tidy the notes up for notation software or a DAW grid:
+
+```bash
+muscriptor transcribe audio.wav --bpm 96 --beats-per-bar 3 --first-downbeat 1.2 \
+    --quantize --grid 4 --fill-gaps 0.25 --trim-leading-bars
+```
+
+- `--quantize` snaps notes onto the beat grid (`--grid 4` = sixteenths, `3` = eighth triplets;
+  by default the one the notes sit on best), `--quantize-strength 0.5` only halfway.
+- `--fill-gaps` holds notes until the next one across rests of up to that many beats, which
+  notation software such as Guitar Pro would otherwise write out.
+- `--trim-leading-bars` drops the empty bars before the first note.
+
+The web UI has the same settings: the "Tempo & bars" panel and the MIDI download dialog.
+
 ### Sheet music
 
 Using the CLI with `--format sheets` engraves the transcription as readable notation instead of

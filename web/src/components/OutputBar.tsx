@@ -2,21 +2,19 @@ import { useEffect, useRef, useState, type RefObject } from "react";
 import clsx from "clsx";
 import { unzipSync } from "fflate";
 import { Button } from "./Button";
+import { MidiExportDialog } from "./MidiExportDialog";
 import { SheetsDialog, type SheetFile } from "./SheetsDialog";
 import type { TranscriptionResult } from "../hooks/useTranscription";
 import { IconChevron, IconDownload } from "./icons";
 import { track } from "../analytics";
-
-/** The FastAPI `detail` of a failed response, or its raw body if it isn't one. */
-async function errorDetail(resp: Response): Promise<string> {
-  const text = await resp.text();
-  try {
-    return JSON.parse(text).detail ?? text;
-  } catch {
-    // not JSON — keep the raw body
-    return text;
-  }
-}
+import {
+  correctedGrid,
+  DEFAULT_CLEANUP,
+  errorDetail,
+  exportMidi,
+  isRetimed,
+  type TimingOverrides,
+} from "../export";
 
 /**
  * Output / "job" actions, shown below the piano roll: live transcription
@@ -36,6 +34,8 @@ export function OutputBar(props: {
   result: TranscriptionResult | null;
   /** Source audio, re-uploaded to /auralize alongside the MIDI for the mix. */
   currentFile: File | null;
+  /** The user's corrections to the detected grid, which every export follows. */
+  timing: TimingOverrides;
   onTranscribeAnother: () => void;
 }) {
   const {
@@ -44,6 +44,7 @@ export function OutputBar(props: {
     progressLabelRef,
     result,
     currentFile,
+    timing,
     onTranscribeAnother,
   } = props;
   // Label shown on the Download button while a server-side render runs, or null
@@ -52,14 +53,18 @@ export function OutputBar(props: {
   const [menuOpen, setMenuOpen] = useState(false);
   // The unpacked sheet-music archive, once /sheets has answered. Kept after the
   // dialog is dismissed so reopening the picker doesn't engrave the same score
-  // again — the transcription it was rendered from cannot change without this
-  // whole bar unmounting.
+  // again — unless the tempo it was engraved at has been corrected since
+  // (`timingKey`); the transcription itself cannot change without this whole
+  // bar unmounting.
   const [sheets, setSheets] = useState<{
     files: SheetFile[];
     zipBlob: Blob;
     zipFilename: string;
+    quantized: boolean;
+    timingKey: string;
   } | null>(null);
   const [sheetsOpen, setSheetsOpen] = useState(false);
+  const [midiOpen, setMidiOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const ready = result !== null;
 
@@ -79,15 +84,6 @@ export function OutputBar(props: {
       document.removeEventListener("keydown", onKey);
     };
   }, [menuOpen]);
-
-  function download() {
-    if (result === null) return;
-    track("download", { format: "midi" });
-    const a = document.createElement("a");
-    a.href = result.url;
-    a.download = result.filename;
-    a.click();
-  }
 
   /** The uploaded file's name without its extension, for naming exports. */
   function stem(): string {
@@ -135,19 +131,26 @@ export function OutputBar(props: {
   async function downloadSheets() {
     if (result === null) return;
     track("download", { format: "sheets" });
-    // Already engraved this run — just show the picker again.
-    if (sheets !== null) {
+    // Already engraved at this tempo — just show the picker again.
+    const timingKey = JSON.stringify(timing);
+    if (sheets !== null && sheets.timingKey === timingKey) {
       setSheetsOpen(true);
       return;
     }
     setBusy("Generating…");
     try {
-      const form = new FormData();
-      // Engrave the grid-snapped notes when the server managed to snap them:
+      // Engrave grid-snapped notes whenever there is a tempo to snap them to:
       // notation made from raw transcription can have spurious 128th notes etc.
-      const engrave = result.quantizedMidi ?? result.midi;
+      const quantized = correctedGrid(result.beatGrid, timing) !== null;
+      const engrave = await exportMidi(result.notes, result.beatGrid, timing, {
+        ...DEFAULT_CLEANUP,
+        quantize: quantized,
+        // A corrected tempo has no measured subdivision; sixteenths are safe.
+        subdivision: isRetimed(result.beatGrid, timing) ? 4 : null,
+      });
+      const form = new FormData();
       form.append("midi", engrave, "transcription.mid");
-      form.append("quantized", String(result.quantizedMidi !== null));
+      form.append("quantized", String(quantized));
       const resp = await fetch("/sheets", { method: "POST", body: form });
       if (!resp.ok) throw new Error(await errorDetail(resp));
       const zipBlob = await resp.blob();
@@ -164,7 +167,13 @@ export function OutputBar(props: {
         bytes: bytes as Uint8Array<ArrayBuffer>,
       }));
       if (files.length === 0) throw new Error("the server returned an empty archive");
-      setSheets({ files, zipBlob, zipFilename: stem() + "_sheets.zip" });
+      setSheets({
+        files,
+        zipBlob,
+        zipFilename: stem() + "_sheets.zip",
+        quantized,
+        timingKey,
+      });
       setSheetsOpen(true);
     } catch (e) {
       track("download_error", { format: "sheets", message: (e as Error).message });
@@ -236,10 +245,10 @@ export function OutputBar(props: {
                 className={menuItem}
                 onClick={() => {
                   setMenuOpen(false);
-                  download();
+                  setMidiOpen(true);
                 }}
               >
-                MIDI file
+                MIDI file…
               </Button>
               <Button
                 kind="ghost"
@@ -298,8 +307,16 @@ export function OutputBar(props: {
           files={sheets.files}
           zipBlob={sheets.zipBlob}
           zipFilename={sheets.zipFilename}
-          quantized={result?.quantizedMidi != null}
+          quantized={sheets.quantized}
           onClose={() => setSheetsOpen(false)}
+        />
+      )}
+
+      {result && midiOpen && (
+        <MidiExportDialog
+          result={result}
+          timing={timing}
+          onClose={() => setMidiOpen(false)}
         />
       )}
     </div>

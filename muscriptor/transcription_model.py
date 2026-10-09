@@ -52,7 +52,7 @@ from muscriptor.utils.beats import (
     detect_grid,
 )
 from muscriptor.utils.download import download_companion, download_if_necessary
-from muscriptor.utils.midi import notes_to_midi
+from muscriptor.utils.midi import ExportOptions, notes_to_midi, resolve_grid
 
 
 @contextlib.contextmanager
@@ -630,19 +630,22 @@ class TranscriptionModel:
         beam_size: int = 1,
         prelude_forcing: bool = True,
         detect_tempo: TempoDetection = "best-effort",
-        quantize: bool = False,
+        export: ExportOptions | None = None,
     ) -> tuple[bytes, BeatGrid | None]:
         """Same as :meth:`transcribe`, but as a MIDI file plus the grid it used.
 
-        The grid comes back measured against the transcription's own onsets, so
-        its `onset_delay` and `beat_subdivision` are filled in; it is None when
-        no tempo was detected.
+        The grid comes back with `export`'s corrections applied and measured
+        against the transcription's own onsets, so its `onset_delay` and
+        `beat_subdivision` are filled in; it is None when no tempo was detected
+        or given.
 
-        `quantize` snaps the notes onto that subdivision, which is what sheet
-        music has to be engraved from (see :meth:`events_to_midi_bytes`) and not
-        what anyone wants to listen to. The returned grid says whether there was
-        a subdivision to snap to at all.
+        `export` says how to write the notes (see
+        :class:`muscriptor.utils.midi.ExportOptions`). Quantizing is what sheet
+        music has to be engraved from and not what anyone wants to listen to;
+        the returned grid's `beat_subdivision` says whether there was a
+        subdivision to snap to at all.
         """
+        export = export or ExportOptions()
         beat_grid = self.detect_beat_grid_for(audio, detect_tempo)
         events = list(
             self.transcribe(
@@ -657,12 +660,14 @@ class TranscriptionModel:
                 prelude_forcing=prelude_forcing,
             )
         )
-        if beat_grid is not None:
-            beat_grid = beat_grid.with_onset_delay(
-                [ev.start_time for ev in events if isinstance(ev, NoteStartEvent)]
+        if beat_grid is not None or export.bpm is not None:
+            beat_grid = resolve_grid(
+                beat_grid,
+                export,
+                [ev.start_time for ev in events if isinstance(ev, NoteStartEvent)],
             )
         midi_bytes = self.events_to_midi_bytes(
-            iter(events), beat_grid=beat_grid, quantize=quantize
+            iter(events), beat_grid=beat_grid, export=export
         )
         return midi_bytes, beat_grid
 
@@ -699,17 +704,17 @@ class TranscriptionModel:
         self,
         events: Iterator[NoteStartEvent | NoteEndEvent | ProgressEvent],
         beat_grid: BeatGrid | None = None,
-        quantize: bool = False,
+        export: ExportOptions | None = None,
     ) -> bytes:
         """Reassemble Notes from a NoteStart/NoteEnd stream and serialize MIDI.
 
         Shared by :meth:`transcribe_and_postprocess` and the HTTP server, so the MIDI
         bytes are identical regardless of how the events were obtained.
 
-        `quantize` snaps the notes onto `beat_grid.beat_subdivision` first,
-        which is what sheet music has to be engraved from (see
-        `muscriptor.utils.midi.quantized_notes`) and not what anyone wants to
-        listen to. Call twice for both versions of the same transcription.
+        `export` corrects the grid and tidies the notes up (see
+        `muscriptor.utils.midi.ExportOptions`); quantizing is what sheet music has
+        to be engraved from and not what anyone wants to listen to. Call twice
+        for both versions of the same transcription.
         """
         notes: list[Note] = []
         open_notes: dict[int, Note] = {}
@@ -743,7 +748,7 @@ class TranscriptionModel:
         notes = validate_notes(notes, fix=True)
         notes = trim_overlapping_notes(notes, sort=True)
         midi = notes_to_midi(
-            notes, program_names=program_names, beat_grid=beat_grid, quantize=quantize
+            notes, program_names=program_names, beat_grid=beat_grid, options=export
         )
         buf = io.BytesIO()
         midi.save(file=buf)

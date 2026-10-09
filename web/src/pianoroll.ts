@@ -33,6 +33,9 @@ export interface BeatGrid {
    * move: subtract this from every note time, as the MIDI file already does.
    */
   onset_delay: number;
+  /** Steps per beat the onsets sit on (4 = sixteenths), or null if none: what
+   *  /export quantizes to unless told otherwise. */
+  beat_subdivision?: number | null;
 }
 
 /** Don't shade measures narrower than this (px) — double the shading step instead. */
@@ -329,6 +332,15 @@ export class PianoRoll {
       n.end -= grid.onset_delay;
     }
     this.latestNoteStart -= grid.onset_delay;
+  }
+
+  /**
+   * Redraw the bar lines for a corrected grid (the user's tempo, meter or
+   * downbeat) without moving any notes: they were moved onto the beats once, by
+   * setBeatGrid, and a different tempo does not change where they sound.
+   */
+  setGridLines(grid: BeatGrid | null) {
+    this.beatGrid = grid;
   }
 
   /** Tell the roll the loaded audio length, which bounds the time-axis scroll. */

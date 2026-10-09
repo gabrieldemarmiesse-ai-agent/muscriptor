@@ -7,17 +7,23 @@ or any format soundfile/libsndfile can read — mp3, flac, ogg, m4a, …) return
 `progress` chunk anchors (`{completed, total}`), and a final
 `transcription_complete` event carrying the base64-encoded .mid file (`data`)
 plus the detected `beat_grid`
-(`{bpm, beats_per_bar, first_downbeat, onset_delay}`, or null if no tempo was
-found). `onset_delay` is how late the streamed note times are against those
-beats: the MIDI has it taken out already, an SSE consumer has to subtract it.
+(`{bpm, beats_per_bar, first_downbeat, onset_delay, beat_subdivision}`, or null
+if no tempo was found). `onset_delay` is how late the streamed note times are
+against those beats: the MIDI has it taken out already, an SSE consumer has to
+subtract it.
+
+POST /export takes JSON instead: the streamed notes, that `beat_grid`, and
+`options` (`muscriptor.utils.midi.ExportOptions`: tempo/meter/downbeat
+corrections, quantization, gap filling), and returns the .mid written with
+them. It runs no model, so the UI can re-export as the user changes options.
 
 POST /transcribe/midi takes the same upload but blocks until transcription
 completes and returns the raw `audio/midi` bytes directly (no SSE, no
 base64), with a `Content-Disposition: attachment` header. Audio longer than
 15 minutes is rejected with 413.
 
-POST /sheets takes a MIDI upload instead of audio (the `quantized_midi` from
-/transcribe, with `quantized=true`) and returns every file
+POST /sheets takes a MIDI upload instead of audio (a quantized one from
+/export, with `quantized=true`) and returns every file
 `muscriptor.utils.sheets.write_sheets` engraves from it — MusicXML, the full
 score, one PDF per instrument — as a single uncompressed zip. It needs
 MuseScore 4+ on the server, and answers 503 when there is none.
@@ -40,6 +46,7 @@ from typing import Annotated, Callable
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 from muscriptor.events import NoteEndEvent, NoteStartEvent, ProgressEvent
@@ -47,8 +54,9 @@ from muscriptor.soundfonts import SF3_URL
 from muscriptor.tokenizer.mt3 import MT3_FULL_PLUS_GROUP_NAMES
 from muscriptor.transcription_model import TranscriptionModel
 from muscriptor.utils.audio import _read_non_wav_file, _read_wav_file
-from muscriptor.utils.beats import BeatDetectionError, TempoDetection
+from muscriptor.utils.beats import BeatDetectionError, BeatGrid, TempoDetection
 from muscriptor.utils.download import download_if_necessary
+from muscriptor.utils.midi import ExportOptions
 from muscriptor.utils.sheets import (
     MuseScoreError,
     MuseScoreNotFoundError,
@@ -101,6 +109,58 @@ def engrave_to_zip(midi_bytes: bytes, quantized: bool = False) -> bytes:
             for path in written:
                 archive.write(path, arcname=path.name)
         return buf.getvalue()
+
+
+class ExportNote(BaseModel):
+    """A note as /transcribe streamed it: times not yet moved by `onset_delay`."""
+
+    instrument: str
+    pitch: int = Field(ge=0, le=127)
+    start: float
+    end: float
+
+
+class ExportGrid(BaseModel):
+    """The `beat_grid` /transcribe sent, passed back as it came."""
+
+    bpm: float = Field(gt=0)
+    beats_per_bar: int | None = None
+    first_downbeat: float = 0.0
+    onset_delay: float = 0.0
+    beat_subdivision: int | None = None
+
+
+class ExportSettings(BaseModel):
+    """`ExportOptions`, with the bounds a client could get wrong."""
+
+    bpm: float | None = Field(default=None, ge=20, le=400)
+    beats_per_bar: int | None = Field(default=None, ge=1, le=32)
+    first_downbeat: float | None = None
+    quantize: bool = False
+    subdivision: int | None = Field(default=None, ge=1, le=32)
+    strength: float = Field(default=1.0, ge=0, le=1)
+    fill_gaps: float = Field(default=0.0, ge=0, le=16)
+    trim_leading_bars: bool = False
+
+
+class ExportRequest(BaseModel):
+    notes: list[ExportNote]
+    beat_grid: ExportGrid | None = None
+    options: ExportSettings = ExportSettings()
+
+
+def export_events(notes: list[ExportNote]) -> list[NoteStartEvent | NoteEndEvent]:
+    """`notes` as the event stream `events_to_midi_bytes` reassembles them from."""
+    events: list[NoteStartEvent | NoteEndEvent] = []
+    for index, note in enumerate(notes):
+        start = NoteStartEvent(
+            pitch=note.pitch,
+            start_time=note.start,
+            index=index,
+            instrument=note.instrument,
+        )
+        events += [start, NoteEndEvent(end_time=note.end, start_event=start)]
+    return events
 
 
 def event_to_dict(ev: NoteStartEvent | NoteEndEvent) -> dict:
@@ -313,26 +373,12 @@ def create_app(model: TranscriptionModel, web_dir: str | Path | None = None) -> 
                     )
                 midi_bytes = model.events_to_midi_bytes(iter(events), beat_grid=grid)
                 midi_b64 = base64.b64encode(midi_bytes).decode("ascii")
-                # A second copy with the notes snapped to the beat grid. Useful for
-                # writing sheet music where we want "idealized" timing
-                quantized_midi = (
-                    model.events_to_midi_bytes(
-                        iter(events), beat_grid=grid, quantize=True
-                    )
-                    if grid is not None and grid.beat_subdivision is not None
-                    else None
-                )
                 # The grid rides along so the UI can draw bar lines instead of a
                 # fixed seconds grid; null when no tempo was detected.
                 payload = json.dumps(
                     {
                         "type": "transcription_complete",
                         "data": midi_b64,
-                        "quantized_midi": base64.b64encode(quantized_midi).decode(
-                            "ascii"
-                        )
-                        if quantized_midi
-                        else None,
                         # Only the fields the UI draws with; `grid.beats` is an
                         # ndarray and not JSON-serializable anyway.
                         "beat_grid": {
@@ -343,6 +389,8 @@ def create_app(model: TranscriptionModel, web_dir: str | Path | None = None) -> 
                             # the beats; the MIDI already has it taken out, the
                             # UI has to subtract it from the notes it drew.
                             "onset_delay": grid.onset_delay,
+                            # What /export quantizes to unless told otherwise.
+                            "beat_subdivision": grid.beat_subdivision,
                         }
                         if grid
                         else None,
@@ -432,6 +480,34 @@ def create_app(model: TranscriptionModel, web_dir: str | Path | None = None) -> 
             headers={"Content-Disposition": 'attachment; filename="result.mid"'},
         )
 
+    @app.post("/export")
+    async def export(request: ExportRequest) -> Response:
+        """Write the notes /transcribe streamed as MIDI, with export options.
+
+        No model and no lock: this only rebuilds the file, so it is cheap
+        enough to call on every download.
+        """
+        unknown = sorted(
+            {n.instrument for n in request.notes} - MT3_FULL_PLUS_GROUP_NAMES.keys()
+        )
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown instrument name(s): {', '.join(unknown)}",
+            )
+        grid = (
+            BeatGrid(**request.beat_grid.model_dump())
+            if request.beat_grid is not None
+            else None
+        )
+        midi_bytes = await asyncio.to_thread(
+            model.events_to_midi_bytes,
+            iter(export_events(request.notes)),
+            beat_grid=grid,
+            export=ExportOptions(**request.options.model_dump()),
+        )
+        return Response(content=midi_bytes, media_type="audio/midi")
+
     @app.post("/auralize")
     async def auralize(
         midi: Annotated[UploadFile, File()],
@@ -504,8 +580,8 @@ def create_app(model: TranscriptionModel, web_dir: str | Path | None = None) -> 
         MusicXML and the MIDI in a single uncompressed archive and picks from it
         locally. Requires MuseScore 4+ on the server (503 without it).
 
-        `quantized` says the upload is already snapped to a beat grid — the
-        `quantized_midi` from /transcribe — which is what the notation should be
+        `quantized` says the upload is already snapped to a beat grid — a
+        quantized MIDI from /export — which is what the notation should be
         engraved from. Without it the engraving keeps the timing jitter, so this
         does not quantize anything itself.
         """

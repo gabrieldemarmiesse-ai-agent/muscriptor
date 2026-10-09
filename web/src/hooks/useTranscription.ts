@@ -9,6 +9,7 @@ import { track } from "../analytics";
 import type { AudioEngine } from "../audio";
 import type { ProgressEstimator } from "../progress";
 import { PianoRoll, type BeatGrid, type RollNote } from "../pianoroll";
+import type { ExportNote } from "../export";
 
 type StartEvent = {
   type: "start";
@@ -25,9 +26,6 @@ type EndEvent = {
 type TranscriptionCompleteEvent = {
   type: "transcription_complete";
   data: string; // base64-encoded .mid file
-  // The same notes snapped to the beat grid, for engraving; null when there was
-  // no grid to snap them to.
-  quantized_midi: string | null;
   beat_grid: BeatGrid | null; // null when no constant tempo was detected
 };
 type ProgressMsg = {
@@ -42,13 +40,14 @@ export type AppState = "idle" | "transcribing" | "done" | "error";
 
 /** Everything a finished transcription hands the UI to export. */
 export type TranscriptionResult = {
-  /** Object URL of `midi`, for the download anchor. Revoked when replaced. */
-  url: string;
+  /** The MIDI as the server first wrote it, unquantized and on the detected
+   *  grid: what /auralize synthesizes against the original audio. */
   midi: Blob;
-  /** The same notes snapped to the beat grid, which is what sheet music has to
-   *  be engraved from; null when there was no grid to snap them to. */
-  quantizedMidi: Blob | null;
-  /** What to call `midi` when it is saved: the uploaded file's name, as .mid. */
+  /** Every note as streamed, for /export to write out with other options. */
+  notes: ExportNote[];
+  /** The detected grid, null when no constant tempo was found. */
+  beatGrid: BeatGrid | null;
+  /** What to call an exported MIDI: the uploaded file's name, as .mid. */
   filename: string;
 };
 
@@ -121,8 +120,8 @@ export function useTranscription(deps: TranscriptionDeps) {
   const knownRef = useRef(new Set<string>());
   // Provisional notes awaiting their matching `end` event, keyed by start index.
   const openNotesRef = useRef(new Map<number, { startNote: RollNote }>());
-  // Current MIDI object URL, kept so we can revoke it before creating a new one.
-  const midiUrlRef = useRef<string | null>(null);
+  // Finished notes of this run, in streamed (unshifted) time, for /export.
+  const notesRef = useRef<ExportNote[]>([]);
   // The in-flight transcription, if any. Starting a new one aborts this so its
   // (now stale) SSE stream stops feeding notes into the freshly-reset UI/audio.
   const activeRef = useRef<AbortController | null>(null);
@@ -138,38 +137,14 @@ export function useTranscription(deps: TranscriptionDeps) {
     knownRef.current.clear();
     setInstruments([]);
     openNotesRef.current.clear();
+    notesRef.current = [];
     audio.reset();
     setUserScrolled(false);
-  }
-
-  function clearMidi() {
-    if (midiUrlRef.current !== null) {
-      URL.revokeObjectURL(midiUrlRef.current);
-      midiUrlRef.current = null;
-    }
-    setResult(null);
   }
 
   function midiBlobOf(base64: string): Blob {
     const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
     return new Blob([bytes], { type: "audio/midi" });
-  }
-
-  function setMidi(
-    base64: string,
-    quantizedBase64: string | null,
-    filename: string,
-  ) {
-    const midi = midiBlobOf(base64);
-    if (midiUrlRef.current !== null) URL.revokeObjectURL(midiUrlRef.current);
-    const url = URL.createObjectURL(midi);
-    midiUrlRef.current = url;
-    setResult({
-      url,
-      midi,
-      quantizedMidi: quantizedBase64 ? midiBlobOf(quantizedBase64) : null,
-      filename,
-    });
   }
 
   function onEvent(ev: StartEvent | EndEvent) {
@@ -189,6 +164,14 @@ export function useTranscription(deps: TranscriptionDeps) {
       const open = openNotesRef.current.get(ev.start_event_index);
       if (!open) return;
       open.startNote.end = ev.end_time;
+      // Recorded before setBeatGrid moves the roll's copy by the onset delay:
+      // /export takes the times as streamed and moves them itself.
+      notesRef.current.push({
+        instrument: open.startNote.instrument,
+        pitch: open.startNote.pitch,
+        start: open.startNote.start,
+        end: ev.end_time,
+      });
       // Finalize geometry in the roll too — it stamps the reveal time and
       // restacks any overlapping same-pitch notes. (The line above keeps `end`
       // correct for audio scheduling even if the canvas hasn't mounted yet.)
@@ -214,7 +197,7 @@ export function useTranscription(deps: TranscriptionDeps) {
     const isStale = () => activeRef.current !== controller;
 
     reset();
-    clearMidi();
+    setResult(null);
     progress.reset();
     const midiFilename = file.name.replace(/\.[^/.]+$/, "") + ".mid";
     setAppState("transcribing");
@@ -262,12 +245,17 @@ export function useTranscription(deps: TranscriptionDeps) {
         if (isStale()) return;
         const ev = raw as StreamedEvent;
         if (ev.type === "transcription_complete") {
-          // Final event: the assembled MIDI file. Enables the download button.
-          setMidi(ev.data, ev.quantized_midi, midiFilename);
+          // Final event: the assembled MIDI file. Enables the downloads.
+          beatGrid = ev.beat_grid ?? null;
+          setResult({
+            midi: midiBlobOf(ev.data),
+            notes: notesRef.current,
+            beatGrid,
+            filename: midiFilename,
+          });
           // Tempo came with it — redraw the time grid as bars instead of seconds,
           // and move the notes onto the beats (the MIDI above already has them
           // there), in the roll and in the scheduled playback alike.
-          beatGrid = ev.beat_grid ?? null;
           rollRef.current?.setBeatGrid(beatGrid);
           audio.shiftNotes(-(beatGrid?.onset_delay ?? 0));
           continue;

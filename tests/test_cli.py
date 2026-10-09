@@ -13,6 +13,7 @@ from typer.testing import CliRunner
 
 import muscriptor.main as main_mod
 from muscriptor.events import NoteEndEvent, NoteStartEvent
+from muscriptor.utils.midi import ExportOptions
 
 
 class _FakeInner:
@@ -203,3 +204,50 @@ def test_instruments_passed_to_model(patched_model, fake_audio):
     )
     assert result.exit_code == 0, result.stderr
     assert _FakeModel.last_kwargs["instruments"] == ["violin", "drums"]
+
+
+def test_midi_timing_options_reach_the_export(patched_model, fake_audio, tmp_path):
+    runner = CliRunner()
+    result = runner.invoke(
+        main_mod.app,
+        [
+            "transcribe",
+            str(fake_audio),
+            "-o",
+            str(tmp_path / "out.mid"),
+            "--bpm",
+            "92.5",
+            "--beats-per-bar",
+            "3",
+            "--first-downbeat",
+            "1.25",
+            "--quantize",
+            "--grid",
+            "3",
+            "--quantize-strength",
+            "0.75",
+            "--fill-gaps",
+            "0.5",
+            "--trim-leading-bars",
+        ],
+    )
+    assert result.exit_code == 0, result.stderr
+    assert _FakeModel.last_kwargs["export"] == ExportOptions(
+        bpm=92.5,
+        beats_per_bar=3,
+        first_downbeat=1.25,
+        quantize=True,
+        subdivision=3,
+        strength=0.75,
+        fill_gaps=0.5,
+        trim_leading_bars=True,
+    )
+
+
+def test_midi_is_not_quantized_by_default(patched_model, fake_audio, tmp_path):
+    runner = CliRunner()
+    result = runner.invoke(
+        main_mod.app, ["transcribe", str(fake_audio), "-o", str(tmp_path / "out.mid")]
+    )
+    assert result.exit_code == 0, result.stderr
+    assert _FakeModel.last_kwargs["export"] == ExportOptions()

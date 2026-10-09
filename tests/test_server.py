@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import create_autospec
 
 import numpy as np
+from mido import MidiFile
 from fastapi.testclient import TestClient
 
 import muscriptor.server as server_module
@@ -21,6 +22,7 @@ from muscriptor.events import NoteEndEvent, NoteStartEvent, ProgressEvent
 from muscriptor.server import create_app, event_to_dict
 from muscriptor.transcription_model import TranscriptionModel
 from muscriptor.utils.beats import BeatGrid
+from muscriptor.utils.midi import ExportOptions
 from muscriptor.utils.sheets import MuseScoreError, MuseScoreNotFoundError
 
 FAKE_MIDI = b"FAKE_MIDI_BYTES"
@@ -121,7 +123,6 @@ def test_transcribe_streams_sse_events(tmp_path):
         "type": "transcription_complete",
         "data": base64.b64encode(FAKE_MIDI).decode("ascii"),
         # FAKE_MIDI is not real MIDI and there is no grid, so nothing to snap.
-        "quantized_midi": None,
         "beat_grid": None,
     }
     assert model.transcribe.call_count == 1
@@ -150,6 +151,7 @@ def test_transcribe_sends_beat_grid(tmp_path):
         # Two beats and a handful of notes are far too little to measure a lag
         # from, so the UI is told to shift its notes by nothing.
         "onset_delay": 0.0,
+        "beat_subdivision": None,
     }
 
 
@@ -193,7 +195,6 @@ def test_transcribe_empty_stream(tmp_path):
         {
             "type": "transcription_complete",
             "data": base64.b64encode(FAKE_MIDI).decode("ascii"),
-            "quantized_midi": None,
             "beat_grid": None,
         }
     ]
@@ -421,7 +422,6 @@ def test_concurrent_different_clients_do_not_preempt(tmp_path):
         "type": "transcription_complete",
         "data": base64.b64encode(FAKE_MIDI).decode("ascii"),
         # FAKE_MIDI is not real MIDI and there is no grid, so nothing to snap.
-        "quantized_midi": None,
         "beat_grid": None,
     }
 
@@ -648,3 +648,97 @@ def test_sheets_engraves_concurrently(monkeypatch):
     gate.set()
     a.join(timeout=10)
     assert out["first"] == 200
+
+
+# --- /export ----------------------------------------------------------------
+
+_EXPORT_NOTES = [
+    {"instrument": "acoustic_piano", "pitch": 60, "start": 0.5, "end": 1.0},
+    {"instrument": "drums", "pitch": 36, "start": 0.75, "end": 0.76},
+]
+
+
+def test_export_rebuilds_the_events_and_returns_midi():
+    model = make_model()
+    client = TestClient(create_app(model))
+    resp = client.post("/export", json={"notes": _EXPORT_NOTES})
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "audio/midi"
+    assert resp.content == FAKE_MIDI
+
+    (events,), kwargs = model.events_to_midi_bytes.call_args
+    events = list(events)
+    starts = [e for e in events if isinstance(e, NoteStartEvent)]
+    ends = [e for e in events if isinstance(e, NoteEndEvent)]
+    assert [(e.instrument, e.pitch, e.start_time) for e in starts] == [
+        ("acoustic_piano", 60, 0.5),
+        ("drums", 36, 0.75),
+    ]
+    assert [(e.start_event_index, e.end_time) for e in ends] == [
+        (starts[0].index, 1.0),
+        (starts[1].index, 0.76),
+    ]
+    assert kwargs["beat_grid"] is None
+    assert kwargs["export"] == ExportOptions()
+
+
+def test_export_passes_the_grid_and_options_through():
+    model = make_model()
+    client = TestClient(create_app(model))
+    resp = client.post(
+        "/export",
+        json={
+            "notes": _EXPORT_NOTES,
+            "beat_grid": {
+                "bpm": 123.5,
+                "beats_per_bar": 4,
+                "first_downbeat": 0.75,
+                "onset_delay": 0.012,
+                "beat_subdivision": 4,
+            },
+            "options": {"bpm": 61.75, "quantize": True, "fill_gaps": 0.25},
+        },
+    )
+    assert resp.status_code == 200
+    _, kwargs = model.events_to_midi_bytes.call_args
+    assert kwargs["beat_grid"] == BeatGrid(
+        bpm=123.5,
+        beats_per_bar=4,
+        first_downbeat=0.75,
+        onset_delay=0.012,
+        beat_subdivision=4,
+    )
+    assert kwargs["export"] == ExportOptions(bpm=61.75, quantize=True, fill_gaps=0.25)
+
+
+def test_export_rejects_unknown_instruments():
+    client = TestClient(create_app(make_model()))
+    notes = [{"instrument": "kazoo", "pitch": 60, "start": 0.0, "end": 1.0}]
+    resp = client.post("/export", json={"notes": notes})
+    assert resp.status_code == 400
+    assert "kazoo" in resp.json()["detail"]
+
+
+def test_export_rejects_out_of_range_options():
+    client = TestClient(create_app(make_model()))
+    resp = client.post(
+        "/export", json={"notes": _EXPORT_NOTES, "options": {"strength": 2}}
+    )
+    assert resp.status_code == 422
+
+
+def test_export_writes_a_real_midi_file():
+    """End to end through the real MIDI writer, with no weights loaded."""
+    model = make_model()
+    real = TranscriptionModel.events_to_midi_bytes
+    model.events_to_midi_bytes.side_effect = lambda *a, **kw: real(model, *a, **kw)
+    model._program_for_instrument.return_value = 0
+    client = TestClient(create_app(model))
+    resp = client.post(
+        "/export",
+        json={"notes": _EXPORT_NOTES, "options": {"bpm": 90, "beats_per_bar": 3}},
+    )
+    assert resp.status_code == 200
+    midi = MidiFile(file=io.BytesIO(resp.content))
+    tempos = [m.tempo for t in midi.tracks for m in t if m.type == "set_tempo"]
+    assert tempos[0] == round(60_000_000 / 90)

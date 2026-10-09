@@ -145,9 +145,12 @@ def auralize(
 
     # Undo any bar-alignment delay, which exists to put bar lines on
     # downbeats and would otherwise offset the synthesis against the original.
+    # Negative when empty leading bars were trimmed off the MIDI.
     bar_offset = read_bar_offset(MidiFile(str(midi_path)))
-    if bar_offset:
+    if bar_offset > 0:
         synth_audio = synth_audio[round(bar_offset * _SAMPLE_RATE) :]
+    elif bar_offset < 0:
+        synth_audio = np.pad(synth_audio, (round(-bar_offset * _SAMPLE_RATE), 0))
 
     # Load original audio at 44100 Hz mono
     original_audio = _load_mono_44k(original_audio_path)

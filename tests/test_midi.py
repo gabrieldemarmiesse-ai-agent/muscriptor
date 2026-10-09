@@ -8,7 +8,7 @@ from mido import MidiFile
 
 from muscriptor.tokenizer.notes import Note
 from muscriptor.utils.beats import BAR_OFFSET_MARKER, BeatGrid, read_bar_offset
-from muscriptor.utils.midi import notes_to_midi
+from muscriptor.utils.midi import ExportOptions, notes_to_midi
 
 
 def _metas(midi, msg_type):
@@ -227,7 +227,7 @@ def test_quantize_snaps_the_jitter_out():
     step = _sixteenth()
     grid = _quantizing_grid()
     notes = _jittered([i * step for i in range(64)])
-    midi = notes_to_midi(notes, beat_grid=grid, quantize=True)
+    midi = notes_to_midi(notes, beat_grid=grid, options=ExportOptions(quantize=True))
     offset = grid.bar_offset()
     for time in _note_times(midi):
         assert _off_grid(time - offset, step) < 0.002
@@ -238,7 +238,7 @@ def test_quantize_snaps_onto_a_triplet_grid():
     grid = _quantizing_grid(subdivision=3)
     third = 60.0 / grid.bpm / 3
     notes = _jittered([i * third for i in range(64)], jitter=0.005)
-    midi = notes_to_midi(notes, beat_grid=grid, quantize=True)
+    midi = notes_to_midi(notes, beat_grid=grid, options=ExportOptions(quantize=True))
     for time in _note_times(midi):
         assert _off_grid(time - grid.bar_offset(), third) < 0.002
 
@@ -247,16 +247,27 @@ def test_quantize_keeps_notes_too_short_to_survive_rounding():
     """A hit shorter than half a grid step would otherwise round away to nothing."""
     step = _sixteenth()
     notes = _jittered([i * step for i in range(64)], jitter=0.0, duration=step / 10)
-    midi = notes_to_midi(notes, beat_grid=_quantizing_grid(), quantize=True)
+    midi = notes_to_midi(
+        notes, beat_grid=_quantizing_grid(), options=ExportOptions(quantize=True)
+    )
     assert len(_note_times(midi)) == 64
 
 
-def test_no_measured_subdivision_is_nothing_to_snap_to():
-    """A placeholder tempo, mostly: the notes are written as they came in."""
+def test_a_placeholder_tempo_is_nothing_to_snap_to():
+    """Without a tempo, detected or given, the notes are written as they came in."""
     notes = _jittered([i * _sixteenth() for i in range(64)])
+    assert _note_times(
+        notes_to_midi(notes, options=ExportOptions(quantize=True, subdivision=4))
+    ) == _note_times(notes_to_midi(notes))
+
+
+def test_unaligned_onsets_are_not_snapped_to_a_guessed_subdivision():
+    """Onsets on no subdivision of the beat give quantizing nothing to go by."""
+    rng = np.random.default_rng(0)
+    notes = _jittered(np.sort(rng.uniform(0, 30, 64)), jitter=0.0)
     grid = dataclasses.replace(_quantizing_grid(), beat_subdivision=None)
     assert _note_times(
-        notes_to_midi(notes, beat_grid=grid, quantize=True)
+        notes_to_midi(notes, beat_grid=grid, options=ExportOptions(quantize=True))
     ) == _note_times(notes_to_midi(notes, beat_grid=grid))
 
 
@@ -270,3 +281,125 @@ def test_the_grid_carries_the_subdivision_it_measured():
     ]
     measured = grid.with_onset_delay([n.onset for n in eighths])
     assert measured.beat_subdivision == 2
+
+
+# --- export options -------------------------------------------------------
+
+
+def test_a_given_tempo_replaces_the_detected_one():
+    grid = BeatGrid(bpm=103.4, beats_per_bar=4, first_downbeat=0.0)
+    midi = notes_to_midi(_sample_notes(), beat_grid=grid, options=ExportOptions(bpm=90))
+    assert _metas(midi, "set_tempo")[0].tempo == round(60_000_000 / 90)
+
+
+def test_a_given_tempo_needs_no_detected_grid():
+    midi = notes_to_midi(
+        _sample_notes(), options=ExportOptions(bpm=90, beats_per_bar=3)
+    )
+    assert _metas(midi, "set_tempo")[0].tempo == round(60_000_000 / 90)
+    sig = _metas(midi, "time_signature")[0]
+    assert (sig.numerator, sig.denominator) == (3, 4)
+
+
+def test_retiming_keeps_the_notes_where_they_were_in_seconds():
+    """A tempo only moves bar lines: the file plays the same either way."""
+    grid = _quantizing_grid()
+    notes = _jittered([i * _sixteenth() for i in range(16)])
+    times = _note_times(notes_to_midi(notes, beat_grid=grid))
+    retimed = _note_times(
+        notes_to_midi(notes, beat_grid=grid, options=ExportOptions(bpm=97))
+    )
+    assert retimed == pytest.approx(times, abs=0.002)
+
+
+def test_a_given_downbeat_moves_the_bar_lines():
+    """Bar 1 starts at tick 0, so the downbeat decides how far the notes are delayed."""
+    grid = BeatGrid(bpm=120, beats_per_bar=4, first_downbeat=0.0, onset_delay=0.0)
+    notes = [Note(is_drum=False, program=0, onset=1.5, offset=1.9, pitch=60)]
+    midi = notes_to_midi(
+        notes, beat_grid=grid, options=ExportOptions(first_downbeat=0.5)
+    )
+    # Bars are 2 s, with one at 0.5 s: delaying everything by 1.5 s puts it at 2 s.
+    assert _first_note_time(midi) == pytest.approx(3.0, abs=0.002)
+
+
+def test_a_given_subdivision_is_snapped_to():
+    grid = _quantizing_grid(subdivision=4)
+    eighth = 60.0 / grid.bpm / 2
+    notes = _jittered([i * _sixteenth() for i in range(64)])
+    midi = notes_to_midi(
+        notes, beat_grid=grid, options=ExportOptions(quantize=True, subdivision=2)
+    )
+    for time in _note_times(midi):
+        assert _off_grid(time - grid.bar_offset(), eighth) < 0.002
+
+
+def test_half_strength_moves_notes_halfway():
+    grid = _quantizing_grid()
+    notes = [Note(is_drum=False, program=0, onset=0.51, offset=0.6, pitch=60)]
+    midi = notes_to_midi(
+        notes, beat_grid=grid, options=ExportOptions(quantize=True, strength=0.5)
+    )
+    assert _first_note_time(midi) == pytest.approx(0.505, abs=0.002)
+
+
+def test_a_typed_tempo_finds_its_own_subdivision():
+    """The detected subdivision belongs to the detected tempo; a new one is measured."""
+    grid = _quantizing_grid(bpm=100, subdivision=3)
+    step = 60.0 / 120 / 4
+    notes = _jittered([i * step for i in range(96)], jitter=0.004)
+    midi = notes_to_midi(
+        notes, beat_grid=grid, options=ExportOptions(bpm=120, quantize=True)
+    )
+    for time in _note_times(midi):
+        assert _off_grid(time - grid.bar_offset(), step) < 0.002
+
+
+def _note_spans(midi) -> list[tuple[float, float, int]]:
+    """(start, end, pitch) of every note in the file, in seconds."""
+    spans, open_at, time = [], {}, 0.0
+    for msg in midi:
+        time += msg.time
+        if msg.type == "note_on" and msg.velocity:
+            open_at[msg.note] = time
+        elif msg.type in ("note_on", "note_off"):
+            spans.append((open_at.pop(msg.note), time, msg.note))
+    return sorted(spans)
+
+
+def test_fill_gaps_holds_notes_until_the_next_one():
+    grid = _quantizing_grid()  # 0.5 s beats
+    notes = [
+        Note(is_drum=False, program=0, onset=0.0, offset=0.2, pitch=60),
+        Note(is_drum=False, program=0, onset=0.5, offset=0.6, pitch=62),
+        # 1.4 s of silence: a real rest, longer than the one beat allowed.
+        Note(is_drum=False, program=0, onset=2.0, offset=2.1, pitch=64),
+    ]
+    midi = notes_to_midi(notes, beat_grid=grid, options=ExportOptions(fill_gaps=1))
+    spans = [(round(a, 2), round(b, 2)) for a, b, _ in _note_spans(midi)]
+    assert spans == [(0.0, 0.5), (0.5, 0.6), (2.0, 2.1)]
+
+
+def test_fill_gaps_keeps_instruments_apart_and_leaves_drums_alone():
+    grid = _quantizing_grid()
+    notes = [
+        Note(is_drum=False, program=0, onset=0.0, offset=0.2, pitch=60),
+        Note(is_drum=False, program=33, onset=0.3, offset=0.4, pitch=40),
+        Note(is_drum=True, program=128, onset=0.4, offset=0.4, pitch=36),
+    ]
+    midi = notes_to_midi(notes, beat_grid=grid, options=ExportOptions(fill_gaps=1))
+    ends = {pitch: round(b - a, 2) for a, b, pitch in _note_spans(midi)}
+    assert ends[60] == 0.2
+    assert ends[40] == 0.1
+    assert ends[36] == 0.01
+
+
+def test_trim_leading_bars_drops_the_silence_before_the_first_note():
+    grid = BeatGrid(bpm=120, beats_per_bar=4, first_downbeat=0.0, onset_delay=0.0)
+    notes = [Note(is_drum=False, program=0, onset=9.0, offset=9.5, pitch=60)]
+    midi = notes_to_midi(
+        notes, beat_grid=grid, options=ExportOptions(trim_leading_bars=True)
+    )
+    # 2 s bars: the four empty ones go, the note keeps its place in its bar.
+    assert _first_note_time(midi) == pytest.approx(1.0, abs=0.002)
+    assert read_bar_offset(midi) == pytest.approx(-8.0)

@@ -9,6 +9,8 @@ import {
 } from "./hooks/useTranscription";
 import { Controls } from "./components/Controls";
 import { OutputBar } from "./components/OutputBar";
+import { TimingPanel } from "./components/TimingPanel";
+import { correctedGrid, NO_OVERRIDES, type TimingOverrides } from "./export";
 import { FeedbackLine } from "./components/FeedbackLine";
 import { PianoRollCanvas } from "./components/PianoRollCanvas";
 import { InstrumentList } from "./components/InstrumentList";
@@ -82,6 +84,9 @@ export function App() {
   const [instruments, setInstruments] = useState<string[]>([]);
   // The finished transcription's exports
   const [result, setResult] = useState<TranscriptionResult | null>(null);
+  // The user's corrections to the detected tempo/meter/bar lines; every export
+  // follows them. Cleared along with the result when a new run starts.
+  const [timing, setTiming] = useState<TimingOverrides>(NO_OVERRIDES);
   const [currentFile, setCurrentFile] = useState<File | null>(null);
   const [mix, setMix] = useState(0.75);
   const [stereo, setStereo] = useState(false);
@@ -336,6 +341,19 @@ export function App() {
     return () => cancelAnimationFrame(raf);
   }, [audio]);
 
+  // A new run starts from what it detects, not from the last file's corrections.
+  useEffect(() => {
+    if (result === null) setTiming(NO_OVERRIDES);
+  }, [result]);
+
+  // Redraw the roll's bar lines on the corrected grid. The notes were moved onto
+  // the detected beats once, when the grid arrived; this only moves bar lines.
+  useEffect(() => {
+    if (result !== null) {
+      rollRef.current?.setGridLines(correctedGrid(result.beatGrid, timing));
+    }
+  }, [result, timing]);
+
   // Expose for browser-devtools debugging.
   useEffect(() => {
     (window as unknown as { __mu: unknown }).__mu = { audio, rollRef };
@@ -438,6 +456,14 @@ export function App() {
               come in. */}
           <div className="col-start-2 flex flex-col gap-3 max-[760px]:col-start-1">
             <InstrumentList instruments={instruments} given={condSelected} audio={audio} rollRef={rollRef} />
+            {result && (
+              <TimingPanel
+                detected={result.beatGrid}
+                timing={timing}
+                onChange={setTiming}
+                getPlayhead={() => audio.seconds}
+              />
+            )}
             <FeedbackLine className="mt-auto px-1" />
           </div>
 
@@ -449,6 +475,7 @@ export function App() {
             progressLabelRef={progressLabelRef}
             result={result}
             currentFile={currentFile}
+            timing={timing}
             onTranscribeAnother={transcribeAnother}
           />
         </main>

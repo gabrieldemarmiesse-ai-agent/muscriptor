@@ -17,6 +17,7 @@ from muscriptor.tokenizer.mt3 import (
 from muscriptor.transcription_model import TranscriptionModel
 from muscriptor.utils.beats import BeatDetectionError, TempoDetection
 from muscriptor.utils.download import ModelDownloadError
+from muscriptor.utils.midi import ExportOptions
 from muscriptor.utils.sheets import (
     MuseScoreError,
     MuseScoreNotFoundError,
@@ -49,7 +50,7 @@ class OutputFormat(str, Enum):
     sheets = "sheets"
 
 
-def _transcribe(model, kwargs: dict, detect_tempo: str, quantize: bool = False):
+def _transcribe(model, kwargs: dict, detect_tempo: str, export: ExportOptions):
     """transcribe_and_postprocess, with the CLI's --detect-tempo spelling and errors."""
     try:
         mode: TempoDetection = {
@@ -58,7 +59,7 @@ def _transcribe(model, kwargs: dict, detect_tempo: str, quantize: bool = False):
             "best-effort": "best-effort",
         }[detect_tempo]
         return model.transcribe_and_postprocess(
-            **kwargs, detect_tempo=mode, quantize=quantize
+            **kwargs, detect_tempo=mode, export=export
         )
     except BeatDetectionError as e:
         typer.echo(f"Error: {e}", err=True)
@@ -239,6 +240,95 @@ def transcribe(
             ),
         ),
     ] = "best-effort",
+    bpm: Annotated[
+        float | None,
+        typer.Option(
+            "--bpm",
+            min=20,
+            max=400,
+            help="Write this tempo instead of the detected one.",
+            rich_help_panel="MIDI timing",
+        ),
+    ] = None,
+    beats_per_bar: Annotated[
+        int | None,
+        typer.Option(
+            "--beats-per-bar",
+            min=1,
+            max=32,
+            help="Write this many beats per bar (n/4) instead of the detected meter.",
+            rich_help_panel="MIDI timing",
+        ),
+    ] = None,
+    first_downbeat: Annotated[
+        float | None,
+        typer.Option(
+            "--first-downbeat",
+            help=(
+                "Time in seconds of a bar line in the audio, instead of the "
+                "detected first downbeat."
+            ),
+            rich_help_panel="MIDI timing",
+        ),
+    ] = None,
+    quantize: Annotated[
+        bool,
+        typer.Option(
+            "--quantize/--no-quantize",
+            help=(
+                "Snap note starts and ends onto the beat grid. Always on for "
+                "--format sheets."
+            ),
+            rich_help_panel="MIDI timing",
+        ),
+    ] = False,
+    grid: Annotated[
+        int | None,
+        typer.Option(
+            "--grid",
+            min=1,
+            max=32,
+            help=(
+                "Steps per beat to quantize to: 4 = sixteenths, 3 = eighth "
+                "triplets, … Default: the one the notes sit on best."
+            ),
+            rich_help_panel="MIDI timing",
+        ),
+    ] = None,
+    quantize_strength: Annotated[
+        float,
+        typer.Option(
+            "--quantize-strength",
+            min=0.0,
+            max=1.0,
+            help="How far to move notes onto the grid: 1 all the way, 0.5 halfway.",
+            rich_help_panel="MIDI timing",
+        ),
+    ] = 1.0,
+    fill_gaps: Annotated[
+        float,
+        typer.Option(
+            "--fill-gaps",
+            min=0.0,
+            help=(
+                "Hold notes on until the next note of their instrument when the "
+                "silence in between is at most this many beats, to avoid "
+                "spurious rests in notation software. 0 disables."
+            ),
+            rich_help_panel="MIDI timing",
+        ),
+    ] = 0.0,
+    trim_leading_bars: Annotated[
+        bool,
+        typer.Option(
+            "--trim-leading-bars",
+            help=(
+                "Drop the empty bars before the first note. The MIDI then no "
+                "longer lines up with the start of the audio."
+            ),
+            rich_help_panel="MIDI timing",
+        ),
+    ] = False,
 ) -> None:
     """Transcribe an audio file to MIDI."""
     instrument_names: list[str] | None = None
@@ -323,16 +413,28 @@ def transcribe(
         prelude_forcing=prelude_forcing,
     )
 
+    export = ExportOptions(
+        bpm=bpm,
+        beats_per_bar=beats_per_bar,
+        first_downbeat=first_downbeat,
+        # Sheets are always quantized to get the "idealized" timing, otherwise we
+        # might get very weird 1/64th rests etc.
+        quantize=quantize or format == OutputFormat.sheets,
+        subdivision=grid,
+        strength=quantize_strength,
+        fill_gaps=fill_gaps,
+        trim_leading_bars=trim_leading_bars,
+    )
+
     if format == OutputFormat.sheets:
-        # Quantize to get the "idealized" timing, otherwise we might get very weird
-        # 1/64th rests etc.
-        midi_bytes, grid = _transcribe(model, kwargs, detect_tempo, quantize=True)
+        midi_bytes, beat_grid = _transcribe(model, kwargs, detect_tempo, export)
         typer.echo(f"Engraving sheet music with MuseScore → {output} …", err=True)
         try:
             written = write_sheets(
                 midi_bytes,
                 output,
-                quantized=grid is not None and grid.beat_subdivision is not None,
+                quantized=beat_grid is not None
+                and beat_grid.beat_subdivision is not None,
             )
         except MuseScoreError as e:
             typer.echo(f"Error: {e}", err=True)
@@ -341,7 +443,7 @@ def transcribe(
             typer.echo(f"  {path.name}", err=True)
         typer.echo(f"Saved {len(written)} files to {output}", err=True)
     elif format == OutputFormat.midi:
-        midi_bytes, _ = _transcribe(model, kwargs, detect_tempo)
+        midi_bytes, _ = _transcribe(model, kwargs, detect_tempo, export)
         if is_stdout:
             sys.stdout.buffer.write(midi_bytes)
             sys.stdout.buffer.flush()

@@ -22,6 +22,10 @@ MIN_METER_AGREEMENT = 0.9
 
 MIN_BEATS = 8
 
+# A tracked beat closer than this many median beat spacings to the previous one
+# is an extra beat; see regularized_beats().
+EXTRA_BEAT_SPACING = 0.7
+
 # Marker text prefix recording how far notes were delayed to align bar lines,
 # so `/auralize` can line the synthesis back up with the original audio.
 BAR_OFFSET_MARKER = "muscriptor:bar_offset="
@@ -286,6 +290,32 @@ def fit_tempo(beats: np.ndarray) -> tuple[float, float]:
     return 60.0 / float(slope), float(residual.std())
 
 
+def regularized_beats(beats: np.ndarray) -> np.ndarray:
+    """`beats` with the tracker's missed beats put back and its extra ones dropped.
+
+    beat_this sometimes skips a beat (a break, a held chord) or adds one between
+    two. Every later beat then has the wrong index, so the constant-tempo fit
+    misses a steady song by a whole beat and calls it unsteady, and a tempo map
+    read off the beats halves or doubles the tempo for a moment. Measured against
+    the median spacing, a gap of about n beats gets n - 1 evenly spaced beats
+    filled in, and a beat much closer than one spacing to the previous one is
+    dropped.
+    """
+    beats = np.asarray(beats, dtype=float)
+    if len(beats) < 3:
+        return beats
+    period = float(np.median(np.diff(beats)))
+    kept = [beats[0]]
+    for beat in beats[1:]:
+        beats_apart = (beat - kept[-1]) / period
+        if beats_apart < EXTRA_BEAT_SPACING:
+            continue
+        missing = max(1, round(beats_apart))
+        kept.extend(kept[-1] + (beat - kept[-1]) * np.arange(1, missing) / missing)
+        kept.append(beat)
+    return np.asarray(kept)
+
+
 def infer_beats_per_bar(
     beats: np.ndarray,
     downbeats: np.ndarray,
@@ -350,7 +380,7 @@ def detect_grid(
         checkpoint_path=checkpoint, device=device, dbn=False
     )(signal, sr)
 
-    beats = np.asarray(beats, dtype=float)
+    beats = regularized_beats(np.asarray(beats, dtype=float))
     downbeats = np.asarray(downbeats, dtype=float)
     if len(beats) < MIN_BEATS:
         raise BeatDetectionError(

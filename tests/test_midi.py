@@ -1,6 +1,7 @@
 """Tests for muscriptor/utils/midi.py."""
 
 import dataclasses
+import math
 
 import numpy as np
 import pytest
@@ -9,7 +10,12 @@ from mido import MidiFile
 
 from muscriptor.tokenizer.notes import Note
 from muscriptor.utils.beats import BAR_OFFSET_MARKER, BeatGrid, read_bar_offset
-from muscriptor.utils.midi import ExportOptions, notes_to_midi
+from muscriptor.utils.midi import (
+    TEMPO_MAP_TOLERANCE,
+    TICKS_PER_BEAT,
+    ExportOptions,
+    notes_to_midi,
+)
 
 
 def _metas(midi, msg_type):
@@ -438,6 +444,24 @@ def _on_beats(beats, every: float = 1.0) -> list[Note]:
     ]
 
 
+# How many ticks a tempo map may put a note on a tracked beat off its beat:
+# TEMPO_MAP_TOLERANCE at the fastest of _accelerating_beats' tempi.
+SLACK = math.ceil(TEMPO_MAP_TOLERANCE * 140 / 60 * TICKS_PER_BEAT)
+
+
+def _off_grid_ticks(tick: int, step: int) -> int:
+    return abs(tick - step * round(tick / step))
+
+
+def _tempo_change_ticks(midi) -> list[int]:
+    ticks, tick = [], 0
+    for msg in midi.tracks[0]:
+        tick += msg.time
+        if msg.type == "set_tempo":
+            ticks.append(tick)
+    return ticks
+
+
 def _note_ticks(midi) -> list[int]:
     ticks = []
     for track in midi.tracks:
@@ -453,12 +477,30 @@ def test_an_unsteady_grid_is_written_as_a_tempo_map():
     beats = _accelerating_beats()
     midi = notes_to_midi(_on_beats(beats), beat_grid=_rubato_grid(beats))
     tempi = [m.tempo for m in midi.tracks[0] if m.type == "set_tempo"]
-    assert len(tempi) > 20
-    assert tempi[0] > tempi[-1]  # speeding up: fewer microseconds per beat
-    # Every note lands on a beat of the score, and the first on a bar line.
+    assert len(tempi) > 3
+    assert tempi == sorted(tempi, reverse=True)  # speeding up: fewer µs per beat
+    # Tempo changes only on bar lines, at most one per bar.
+    bar = 4 * midi.ticks_per_beat
+    assert all(t % bar == 0 for t in _tempo_change_ticks(midi))
+    assert len(tempi) <= len(beats) // 4 + 1
+    # Every note lands near a beat of the score, and the first on a bar line.
     ticks = _note_ticks(midi)
-    assert all(t % midi.ticks_per_beat == 0 for t in ticks)
-    assert ticks[0] % (4 * midi.ticks_per_beat) == 0
+    assert all(_off_grid_ticks(t, midi.ticks_per_beat) <= SLACK for t in ticks)
+    assert ticks[0] % bar == 0
+
+
+def test_a_wobbling_steady_tempo_is_written_as_one_tempo():
+    """A band without a click drifts a few ms around its tempo: no tempo map for that."""
+    rng = np.random.default_rng(0)
+    beats = 0.4 + np.arange(200) * (60.0 / 115.0) + rng.uniform(-0.01, 0.01, 200)
+    midi = notes_to_midi(
+        _on_beats(beats),
+        beat_grid=_rubato_grid(beats),
+        options=ExportOptions(tempo_map=True),
+    )
+    bpms = [mido.tempo2bpm(m.tempo) for m in midi.tracks[0] if m.type == "set_tempo"]
+    assert len(bpms) <= 3
+    assert all(abs(b - 115) < 1 for b in bpms)
 
 
 def test_a_tempo_map_keeps_the_notes_where_they_were_in_seconds():
@@ -488,7 +530,8 @@ def test_a_doubled_beat_puts_notes_on_every_other_beat_and_doubles_the_meter():
         beat_grid=_rubato_grid(beats),
         options=ExportOptions(beat_scale=2),
     )
-    assert all(t % (2 * midi.ticks_per_beat) == 0 for t in _note_ticks(midi))
+    two = 2 * midi.ticks_per_beat
+    assert all(_off_grid_ticks(t, two) <= 2 * SLACK for t in _note_ticks(midi))
     assert _metas(midi, "time_signature")[0].numerator == 8
 
 
@@ -502,7 +545,7 @@ def test_a_halved_beat_puts_notes_between_beats_and_halves_the_meter():
     # The beats dropped from the tempo map were not quite halfway between the
     # ones kept, the tempo being on the move; they still land close to it.
     half = midi.ticks_per_beat // 2
-    assert all(abs(t - half * round(t / half)) <= 5 for t in _note_ticks(midi))
+    assert all(_off_grid_ticks(t, half) <= SLACK // 2 + 5 for t in _note_ticks(midi))
     assert _metas(midi, "time_signature")[0].numerator == 2
 
 
@@ -517,7 +560,9 @@ def test_a_given_downbeat_snaps_to_the_nearest_tracked_beat():
     )
     ticks = _note_ticks(midi)
     bar = 4 * midi.ticks_per_beat
-    assert [t % bar for t in ticks[:4]] == [2 * bar // 4, 3 * bar // 4, 0, bar // 4]
+    expected = [2 * bar // 4, 3 * bar // 4, 0, bar // 4]
+    for tick, want in zip(ticks[:4], expected):
+        assert abs((tick - want + bar // 2) % bar - bar // 2) <= SLACK
 
 
 def test_quantizing_follows_the_tempo_map():

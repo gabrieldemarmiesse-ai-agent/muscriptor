@@ -160,6 +160,11 @@ def nearest(beats: np.ndarray, time: float) -> int:
     return int(np.abs(beats - time).argmin())
 
 
+# How far, in seconds, a tempo map may put a beat off the tracked one so as to
+# change tempo less often (see Timeline.simplified). About the tracker's own
+# 20 ms precision, and a fifth of a sixteenth at 120 BPM.
+TEMPO_MAP_TOLERANCE = 0.025
+
 # Beats around each beat that `smoothed_beats` fits a curve through.
 SMOOTHING_WINDOW = 9
 
@@ -230,7 +235,7 @@ def measure_subdivision(onsets: np.ndarray, grid: BeatGrid) -> int | None:
 class Timeline:
     """Where moments of the recording fall in the written score.
 
-    `times` are seconds of the recording, increasing, at consecutive whole
+    `times` are seconds of the recording, increasing, at increasing whole
     `positions` in beats from the start of the file (tick 0). Linear in
     between, and continued at the edge intervals' tempo beyond.
     """
@@ -253,7 +258,8 @@ class Timeline:
 
         Only from tick 0 on: whatever came before has no place in the file.
         """
-        tempi = np.round(np.diff(self.times) * 1e6).astype(int)
+        seconds_per_beat = np.diff(self.times) / np.diff(self.positions)
+        tempi = np.round(seconds_per_beat * 1e6).astype(int)
         # The first interval's tempo also holds before it, back to tick 0.
         changes = [(0, int(tempi[0]))]
         for position, tempo in zip(self.positions[:-1], tempi):
@@ -265,6 +271,33 @@ class Timeline:
             else:
                 changes.append((tick, int(tempo)))
         return changes
+
+    def simplified(self, tolerance: float, bar: int) -> "Timeline":
+        """This timeline with as few tempo changes as keep every beat close.
+
+        A tracked tempo wobbles from beat to beat even in a steady band, and a
+        tempo change written on every beat is noise in a DAW and a tempo marking
+        on every beat in notation software. Kept instead are the bar lines where
+        the tempo has to change for no beat in between to fall more than
+        `tolerance` seconds off the line through them: one tempo for a steady
+        stretch, a change every bar or two through an accelerando. Each stretch
+        is pinned to tracked beats at both ends, so the bar lines never drift.
+        """
+        times, positions = self.times, self.positions
+        last = len(times) - 1
+        # Tempo changes go on bar lines, or at the end.
+        candidates = [i for i in range(1, last) if positions[i] % bar == 0] + [last]
+
+        def fits(a: int, b: int) -> bool:
+            line = np.interp(positions[a : b + 1], positions[[a, b]], times[[a, b]])
+            return bool(np.abs(times[a : b + 1] - line).max() <= tolerance)
+
+        kept = [0]
+        for i, b in enumerate(candidates):
+            # Extend the stretch until the next bar line would bend it too far.
+            if b == last or not fits(kept[-1], candidates[i + 1]):
+                kept.append(b)
+        return Timeline(times[kept], positions[kept])
 
 
 def _extrapolated(x, xp: np.ndarray, fp: np.ndarray):
@@ -295,6 +328,7 @@ def timeline_for(grid: BeatGrid, earliest: float) -> Timeline:
         beats, np.arange(len(beats)) - nearest(beats, grid.first_downbeat)
     )
     bar = grid.beats_per_bar or 1
+    timeline = timeline.simplified(TEMPO_MAP_TOLERANCE, bar)
     return timeline.shifted(bar * math.ceil(-timeline.beats_at(earliest) / bar))
 
 

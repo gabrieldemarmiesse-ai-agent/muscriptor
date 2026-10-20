@@ -19,6 +19,7 @@ from muscriptor.utils.beats import (
     get_onsets_phase,
     infer_beats_per_bar,
     read_bar_offset,
+    regularized_beats,
 )
 
 
@@ -246,3 +247,32 @@ def test_read_bar_offset():
     assert read_bar_offset(_FakeMidi([])) == 0.0
     assert read_bar_offset(_FakeMidi(["some other marker"])) == 0.0
     assert read_bar_offset(_FakeMidi([f"{BAR_OFFSET_MARKER}nonsense"])) == 0.0
+
+
+def test_infer_beats_per_bar_counts_beats_through_tempo_changes():
+    """Bars of a song that speeds up are shorter in seconds, not in beats."""
+    beats = _beats(96.0, n=97, drift=0.3)
+    assert infer_beats_per_bar(beats, beats[::4]) == 4
+
+
+def test_regularized_beats_fills_in_missed_beats():
+    """A steady song whose tracker skipped beats fits its tempo again."""
+    beats = _beats(115.0, n=200)
+    tracked = np.delete(beats, [40, 41, 90, 150])
+    assert fit_tempo(tracked)[1] > MAX_TEMPO_RESIDUAL * 60.0 / 115.0
+    repaired = regularized_beats(tracked)
+    np.testing.assert_allclose(repaired, beats, atol=1e-9)
+    bpm, residual = fit_tempo(repaired)
+    assert abs(bpm - 115.0) < 0.01 and residual < 1e-6
+
+
+def test_regularized_beats_drops_extra_beats():
+    beats = _beats(115.0, n=100)
+    tracked = np.sort(np.append(beats, [beats[30] + 0.2, beats[70] + 0.25]))
+    np.testing.assert_allclose(regularized_beats(tracked), beats, atol=1e-9)
+
+
+def test_regularized_beats_keeps_a_changing_tempo():
+    """Sections 15% either side of the median are tempo changes, not errors."""
+    beats = np.concatenate([_beats(100.0, n=40), _beats(130.0, n=40, start=40 * 0.6)])
+    np.testing.assert_array_equal(regularized_beats(beats), beats)

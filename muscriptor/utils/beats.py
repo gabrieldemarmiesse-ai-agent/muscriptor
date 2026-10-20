@@ -11,7 +11,8 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# Used to detect songs that don't have a constant tempo (don't use a metronome)
+# Used to detect songs that don't have a constant tempo (don't use a metronome).
+# Those are written with a tempo map that follows the tracked beats instead.
 MAX_TEMPO_RESIDUAL = 0.05
 
 # Fraction of bars that must agree on a beats-per-bar count to write a time
@@ -20,6 +21,10 @@ MAX_TEMPO_RESIDUAL = 0.05
 MIN_METER_AGREEMENT = 0.9
 
 MIN_BEATS = 8
+
+# A tracked beat closer than this many median beat spacings to the previous one
+# is an extra beat; see regularized_beats().
+EXTRA_BEAT_SPACING = 0.7
 
 # Marker text prefix recording how far notes were delayed to align bar lines,
 # so `/auralize` can line the synthesis back up with the original audio.
@@ -51,7 +56,7 @@ Onsets = Sequence[float] | np.ndarray
 
 
 class BeatDetectionError(RuntimeError):
-    """No usable beat grid in the audio (too short, or no constant tempo)."""
+    """No usable beat grid in the audio (too short, or too few beats)."""
 
 
 # What to do when the tempo can't be detected: True raises, False doesn't even
@@ -74,7 +79,12 @@ def read_bar_offset(midi) -> float:
 
 @dataclasses.dataclass
 class BeatGrid:
-    """A constant-tempo beat grid detected from audio."""
+    """A beat grid detected from audio.
+
+    `bpm` is the tempo of a straight line through the beats. Whether that line
+    is a fair summary is `steady`: when it is not, the tracked `beats` are the
+    grid, and the MIDI gets a tempo map following them.
+    """
 
     bpm: float
     # None when the meter could not be determined; write no time signature.
@@ -95,6 +105,8 @@ class BeatGrid:
     onset_delay: float | None = None
     # Subdivisions of the beat to use for quantizing the onsets.
     beat_subdivision: int | None = None
+    # Whether the beats fit a constant tempo (see MAX_TEMPO_RESIDUAL).
+    steady: bool = True
 
     @property
     def bar_seconds(self) -> float | None:
@@ -278,6 +290,32 @@ def fit_tempo(beats: np.ndarray) -> tuple[float, float]:
     return 60.0 / float(slope), float(residual.std())
 
 
+def regularized_beats(beats: np.ndarray) -> np.ndarray:
+    """`beats` with the tracker's missed beats put back and its extra ones dropped.
+
+    beat_this sometimes skips a beat (a break, a held chord) or adds one between
+    two. Every later beat then has the wrong index, so the constant-tempo fit
+    misses a steady song by a whole beat and calls it unsteady, and a tempo map
+    read off the beats halves or doubles the tempo for a moment. Measured against
+    the median spacing, a gap of about n beats gets n - 1 evenly spaced beats
+    filled in, and a beat much closer than one spacing to the previous one is
+    dropped.
+    """
+    beats = np.asarray(beats, dtype=float)
+    if len(beats) < 3:
+        return beats
+    period = float(np.median(np.diff(beats)))
+    kept = [beats[0]]
+    for beat in beats[1:]:
+        beats_apart = (beat - kept[-1]) / period
+        if beats_apart < EXTRA_BEAT_SPACING:
+            continue
+        missing = max(1, round(beats_apart))
+        kept.extend(kept[-1] + (beat - kept[-1]) * np.arange(1, missing) / missing)
+        kept.append(beat)
+    return np.asarray(kept)
+
+
 def infer_beats_per_bar(
     beats: np.ndarray,
     downbeats: np.ndarray,
@@ -292,8 +330,10 @@ def infer_beats_per_bar(
     """
     if len(downbeats) < 3 or len(beats) < 2:
         return None
-    beat = float(np.median(np.diff(beats)))
-    counts = np.round(np.diff(downbeats) / beat).astype(int)
+    # Counted in tracked beats rather than measured in seconds, so that a bar
+    # holds as many beats whatever the tempo is doing.
+    index = np.abs(np.asarray(downbeats)[:, None] - beats[None, :]).argmin(axis=1)
+    counts = np.diff(index)
     counts = counts[counts >= 2]
     if not len(counts):
         return None
@@ -317,9 +357,10 @@ def detect_grid(
             the bar offset by a beat or two.
         device: Torch device for the beat model.
 
-    Raises BeatDetectionError when the audio is too short or the beats do not
-    fit a constant tempo. An unclear meter is not fatal: the BeatGrid comes back
-    with beats_per_bar=None, since tempo alone is worth writing.
+    Raises BeatDetectionError when the audio is too short or has too few beats.
+    Neither an unclear meter nor a wandering tempo is fatal: the BeatGrid comes
+    back with beats_per_bar=None or steady=False, since the beats alone are
+    worth writing.
     """
     # Imported here, not at module scope: beat_this pulls in torchaudio and soxr,
     # which would slow every CLI invocation that never transcribes anything.
@@ -339,7 +380,7 @@ def detect_grid(
         checkpoint_path=checkpoint, device=device, dbn=False
     )(signal, sr)
 
-    beats = np.asarray(beats, dtype=float)
+    beats = regularized_beats(np.asarray(beats, dtype=float))
     downbeats = np.asarray(downbeats, dtype=float)
     if len(beats) < MIN_BEATS:
         raise BeatDetectionError(
@@ -347,18 +388,14 @@ def detect_grid(
         )
 
     bpm, residual = fit_tempo(beats)
-    beat_seconds = 60.0 / bpm
-    if residual > MAX_TEMPO_RESIDUAL * beat_seconds:
-        raise BeatDetectionError(
-            f"The recording has no fixed tempo (beats deviate {residual * 1000:.0f} ms "
-            f"RMS from a constant {bpm:.1f} BPM)"
-        )
+    steady = residual <= MAX_TEMPO_RESIDUAL * 60.0 / bpm
 
     beats_per_bar = infer_beats_per_bar(beats, downbeats)
     first_downbeat = float(downbeats[0]) if len(downbeats) else float(beats[0])
     logger.info(
-        "detected %.3f BPM, %s, first downbeat %.3fs (beat residual %.1f ms)",
+        "detected %.3f BPM%s, %s, first downbeat %.3fs (beat residual %.1f ms)",
         bpm,
+        "" if steady else " on average, not steady",
         f"{beats_per_bar}/4" if beats_per_bar else "meter unknown",
         first_downbeat,
         residual * 1000,
@@ -368,4 +405,5 @@ def detect_grid(
         beats_per_bar=beats_per_bar,
         first_downbeat=first_downbeat,
         beats=beats,
+        steady=steady,
     )

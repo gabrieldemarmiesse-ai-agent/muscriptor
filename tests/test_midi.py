@@ -1,14 +1,21 @@
 """Tests for muscriptor/utils/midi.py."""
 
 import dataclasses
+import math
 
 import numpy as np
 import pytest
+import mido
 from mido import MidiFile
 
 from muscriptor.tokenizer.notes import Note
 from muscriptor.utils.beats import BAR_OFFSET_MARKER, BeatGrid, read_bar_offset
-from muscriptor.utils.midi import notes_to_midi
+from muscriptor.utils.midi import (
+    TEMPO_MAP_TOLERANCE,
+    TICKS_PER_BEAT,
+    ExportOptions,
+    notes_to_midi,
+)
 
 
 def _metas(midi, msg_type):
@@ -227,7 +234,7 @@ def test_quantize_snaps_the_jitter_out():
     step = _sixteenth()
     grid = _quantizing_grid()
     notes = _jittered([i * step for i in range(64)])
-    midi = notes_to_midi(notes, beat_grid=grid, quantize=True)
+    midi = notes_to_midi(notes, beat_grid=grid, options=ExportOptions(quantize=True))
     offset = grid.bar_offset()
     for time in _note_times(midi):
         assert _off_grid(time - offset, step) < 0.002
@@ -238,7 +245,7 @@ def test_quantize_snaps_onto_a_triplet_grid():
     grid = _quantizing_grid(subdivision=3)
     third = 60.0 / grid.bpm / 3
     notes = _jittered([i * third for i in range(64)], jitter=0.005)
-    midi = notes_to_midi(notes, beat_grid=grid, quantize=True)
+    midi = notes_to_midi(notes, beat_grid=grid, options=ExportOptions(quantize=True))
     for time in _note_times(midi):
         assert _off_grid(time - grid.bar_offset(), third) < 0.002
 
@@ -247,16 +254,27 @@ def test_quantize_keeps_notes_too_short_to_survive_rounding():
     """A hit shorter than half a grid step would otherwise round away to nothing."""
     step = _sixteenth()
     notes = _jittered([i * step for i in range(64)], jitter=0.0, duration=step / 10)
-    midi = notes_to_midi(notes, beat_grid=_quantizing_grid(), quantize=True)
+    midi = notes_to_midi(
+        notes, beat_grid=_quantizing_grid(), options=ExportOptions(quantize=True)
+    )
     assert len(_note_times(midi)) == 64
 
 
-def test_no_measured_subdivision_is_nothing_to_snap_to():
-    """A placeholder tempo, mostly: the notes are written as they came in."""
+def test_a_placeholder_tempo_is_nothing_to_snap_to():
+    """Without a tempo, detected or given, the notes are written as they came in."""
     notes = _jittered([i * _sixteenth() for i in range(64)])
+    assert _note_times(
+        notes_to_midi(notes, options=ExportOptions(quantize=True, subdivision=4))
+    ) == _note_times(notes_to_midi(notes))
+
+
+def test_unaligned_onsets_are_not_snapped_to_a_guessed_subdivision():
+    """Onsets on no subdivision of the beat give quantizing nothing to go by."""
+    rng = np.random.default_rng(0)
+    notes = _jittered(np.sort(rng.uniform(0, 30, 64)), jitter=0.0)
     grid = dataclasses.replace(_quantizing_grid(), beat_subdivision=None)
     assert _note_times(
-        notes_to_midi(notes, beat_grid=grid, quantize=True)
+        notes_to_midi(notes, beat_grid=grid, options=ExportOptions(quantize=True))
     ) == _note_times(notes_to_midi(notes, beat_grid=grid))
 
 
@@ -270,3 +288,312 @@ def test_the_grid_carries_the_subdivision_it_measured():
     ]
     measured = grid.with_onset_delay([n.onset for n in eighths])
     assert measured.beat_subdivision == 2
+
+
+# --- export options -------------------------------------------------------
+
+
+def test_a_given_tempo_replaces_the_detected_one():
+    grid = BeatGrid(bpm=103.4, beats_per_bar=4, first_downbeat=0.0)
+    midi = notes_to_midi(_sample_notes(), beat_grid=grid, options=ExportOptions(bpm=90))
+    assert _metas(midi, "set_tempo")[0].tempo == round(60_000_000 / 90)
+
+
+def test_a_given_tempo_needs_no_detected_grid():
+    midi = notes_to_midi(
+        _sample_notes(), options=ExportOptions(bpm=90, beats_per_bar=3)
+    )
+    assert _metas(midi, "set_tempo")[0].tempo == round(60_000_000 / 90)
+    sig = _metas(midi, "time_signature")[0]
+    assert (sig.numerator, sig.denominator) == (3, 4)
+
+
+def test_retiming_keeps_the_notes_where_they_were_in_seconds():
+    """A tempo only moves bar lines: the file plays the same either way."""
+    grid = _quantizing_grid()
+    notes = _jittered([i * _sixteenth() for i in range(16)])
+    times = _note_times(notes_to_midi(notes, beat_grid=grid))
+    retimed = _note_times(
+        notes_to_midi(notes, beat_grid=grid, options=ExportOptions(bpm=97))
+    )
+    assert retimed == pytest.approx(times, abs=0.002)
+
+
+def test_a_given_downbeat_moves_the_bar_lines():
+    """Bar 1 starts at tick 0, so the downbeat decides how far the notes are delayed."""
+    grid = BeatGrid(bpm=120, beats_per_bar=4, first_downbeat=0.0, onset_delay=0.0)
+    notes = [Note(is_drum=False, program=0, onset=1.5, offset=1.9, pitch=60)]
+    midi = notes_to_midi(
+        notes, beat_grid=grid, options=ExportOptions(first_downbeat=0.5)
+    )
+    # Bars are 2 s, with one at 0.5 s: delaying everything by 1.5 s puts it at 2 s.
+    assert _first_note_time(midi) == pytest.approx(3.0, abs=0.002)
+
+
+def test_a_given_subdivision_is_snapped_to():
+    grid = _quantizing_grid(subdivision=4)
+    eighth = 60.0 / grid.bpm / 2
+    notes = _jittered([i * _sixteenth() for i in range(64)])
+    midi = notes_to_midi(
+        notes, beat_grid=grid, options=ExportOptions(quantize=True, subdivision=2)
+    )
+    for time in _note_times(midi):
+        assert _off_grid(time - grid.bar_offset(), eighth) < 0.002
+
+
+def test_half_strength_moves_notes_halfway():
+    grid = _quantizing_grid()
+    notes = [Note(is_drum=False, program=0, onset=0.51, offset=0.6, pitch=60)]
+    midi = notes_to_midi(
+        notes, beat_grid=grid, options=ExportOptions(quantize=True, strength=0.5)
+    )
+    assert _first_note_time(midi) == pytest.approx(0.505, abs=0.002)
+
+
+def test_a_typed_tempo_finds_its_own_subdivision():
+    """The detected subdivision belongs to the detected tempo; a new one is measured."""
+    grid = _quantizing_grid(bpm=100, subdivision=3)
+    step = 60.0 / 120 / 4
+    notes = _jittered([i * step for i in range(96)], jitter=0.004)
+    midi = notes_to_midi(
+        notes, beat_grid=grid, options=ExportOptions(bpm=120, quantize=True)
+    )
+    for time in _note_times(midi):
+        assert _off_grid(time - grid.bar_offset(), step) < 0.002
+
+
+def _note_spans(midi) -> list[tuple[float, float, int]]:
+    """(start, end, pitch) of every note in the file, in seconds."""
+    spans, open_at, time = [], {}, 0.0
+    for msg in midi:
+        time += msg.time
+        if msg.type == "note_on" and msg.velocity:
+            open_at[msg.note] = time
+        elif msg.type in ("note_on", "note_off"):
+            spans.append((open_at.pop(msg.note), time, msg.note))
+    return sorted(spans)
+
+
+def test_fill_gaps_holds_notes_until_the_next_one():
+    grid = _quantizing_grid()  # 0.5 s beats
+    notes = [
+        Note(is_drum=False, program=0, onset=0.0, offset=0.2, pitch=60),
+        Note(is_drum=False, program=0, onset=0.5, offset=0.6, pitch=62),
+        # 1.4 s of silence: a real rest, longer than the one beat allowed.
+        Note(is_drum=False, program=0, onset=2.0, offset=2.1, pitch=64),
+    ]
+    midi = notes_to_midi(notes, beat_grid=grid, options=ExportOptions(fill_gaps=1))
+    spans = [(round(a, 2), round(b, 2)) for a, b, _ in _note_spans(midi)]
+    assert spans == [(0.0, 0.5), (0.5, 0.6), (2.0, 2.1)]
+
+
+def test_fill_gaps_keeps_instruments_apart_and_leaves_drums_alone():
+    grid = _quantizing_grid()
+    notes = [
+        Note(is_drum=False, program=0, onset=0.0, offset=0.2, pitch=60),
+        Note(is_drum=False, program=33, onset=0.3, offset=0.4, pitch=40),
+        Note(is_drum=True, program=128, onset=0.4, offset=0.4, pitch=36),
+    ]
+    midi = notes_to_midi(notes, beat_grid=grid, options=ExportOptions(fill_gaps=1))
+    ends = {pitch: round(b - a, 2) for a, b, pitch in _note_spans(midi)}
+    assert ends[60] == 0.2
+    assert ends[40] == 0.1
+    # Drum hits are written 1/32 beat long.
+    assert ends[36] == round(0.5 / 32, 2)
+
+
+def test_trim_leading_bars_drops_the_silence_before_the_first_note():
+    grid = BeatGrid(bpm=120, beats_per_bar=4, first_downbeat=0.0, onset_delay=0.0)
+    notes = [Note(is_drum=False, program=0, onset=9.0, offset=9.5, pitch=60)]
+    midi = notes_to_midi(
+        notes, beat_grid=grid, options=ExportOptions(trim_leading_bars=True)
+    )
+    # 2 s bars: the four empty ones go, the note keeps its place in its bar.
+    assert _first_note_time(midi) == pytest.approx(1.0, abs=0.002)
+    assert read_bar_offset(midi) == pytest.approx(-8.0)
+
+
+# --- tempo map --------------------------------------------------------------
+
+
+def _accelerating_beats(n: int = 48, start: float = 0.5) -> np.ndarray:
+    """Beats speeding up from 100 to about 140 BPM: no constant tempo fits."""
+    intervals = 60.0 / np.linspace(100, 140, n - 1)
+    return start + np.concatenate([[0.0], np.cumsum(intervals)])
+
+
+def _rubato_grid(beats: np.ndarray, beats_per_bar: int | None = 4) -> BeatGrid:
+    return BeatGrid(
+        bpm=120.0,
+        beats_per_bar=beats_per_bar,
+        first_downbeat=float(beats[0]),
+        beats=beats,
+        onset_delay=0.0,
+        beat_subdivision=4,
+        steady=False,
+    )
+
+
+def _on_beats(beats, every: float = 1.0) -> list[Note]:
+    """A note on every `every`-th beat (fractions interpolate between beats)."""
+    positions = np.arange(0, len(beats) - 1, every)
+    times = np.interp(positions, np.arange(len(beats)), beats)
+    return [
+        Note(is_drum=False, program=0, onset=float(t), offset=float(t) + 0.05, pitch=60)
+        for t in times
+    ]
+
+
+# How many ticks a tempo map may put a note on a tracked beat off its beat:
+# TEMPO_MAP_TOLERANCE at the fastest of _accelerating_beats' tempi.
+SLACK = math.ceil(TEMPO_MAP_TOLERANCE * 140 / 60 * TICKS_PER_BEAT)
+
+
+def _off_grid_ticks(tick: int, step: int) -> int:
+    return abs(tick - step * round(tick / step))
+
+
+def _tempo_change_ticks(midi) -> list[int]:
+    ticks, tick = [], 0
+    for msg in midi.tracks[0]:
+        tick += msg.time
+        if msg.type == "set_tempo":
+            ticks.append(tick)
+    return ticks
+
+
+def _note_ticks(midi) -> list[int]:
+    ticks = []
+    for track in midi.tracks:
+        tick = 0
+        for msg in track:
+            tick += msg.time
+            if msg.type == "note_on" and msg.velocity:
+                ticks.append(tick)
+    return sorted(ticks)
+
+
+def test_an_unsteady_grid_is_written_as_a_tempo_map():
+    beats = _accelerating_beats()
+    midi = notes_to_midi(_on_beats(beats), beat_grid=_rubato_grid(beats))
+    tempi = [m.tempo for m in midi.tracks[0] if m.type == "set_tempo"]
+    assert len(tempi) > 3
+    assert tempi == sorted(tempi, reverse=True)  # speeding up: fewer µs per beat
+    # Tempo changes only on bar lines, at most one per bar.
+    bar = 4 * midi.ticks_per_beat
+    assert all(t % bar == 0 for t in _tempo_change_ticks(midi))
+    assert len(tempi) <= len(beats) // 4 + 1
+    # Every note lands near a beat of the score, and the first on a bar line.
+    ticks = _note_ticks(midi)
+    assert all(_off_grid_ticks(t, midi.ticks_per_beat) <= SLACK for t in ticks)
+    assert ticks[0] % bar == 0
+
+
+def test_a_wobbling_steady_tempo_is_written_as_one_tempo():
+    """A band without a click drifts a few ms around its tempo: no tempo map for that."""
+    rng = np.random.default_rng(0)
+    beats = 0.4 + np.arange(200) * (60.0 / 115.0) + rng.uniform(-0.01, 0.01, 200)
+    midi = notes_to_midi(
+        _on_beats(beats),
+        beat_grid=_rubato_grid(beats),
+        options=ExportOptions(tempo_map=True),
+    )
+    bpms = [mido.tempo2bpm(m.tempo) for m in midi.tracks[0] if m.type == "set_tempo"]
+    assert len(bpms) <= 3
+    assert all(abs(b - 115) < 1 for b in bpms)
+
+
+def test_a_tempo_map_keeps_the_notes_where_they_were_in_seconds():
+    """Played back, the file sounds like the recording, delayed by the marker."""
+    beats = _accelerating_beats()
+    notes = _on_beats(beats, every=0.5)
+    midi = notes_to_midi(notes, beat_grid=_rubato_grid(beats))
+    played = np.array(_note_times(midi)) - read_bar_offset(midi)
+    assert played == pytest.approx([n.onset for n in notes], abs=0.003)
+
+
+def test_a_steady_or_unwanted_tempo_map_is_one_tempo():
+    beats = _accelerating_beats()
+    for grid, options in [
+        (dataclasses.replace(_rubato_grid(beats), steady=True), ExportOptions()),
+        (_rubato_grid(beats), ExportOptions(tempo_map=False)),
+        (_rubato_grid(beats), ExportOptions(bpm=110)),
+    ]:
+        midi = notes_to_midi(_on_beats(beats), beat_grid=grid, options=options)
+        assert len(_metas(midi, "set_tempo")) == len(midi.tracks)  # once per track
+
+
+def test_a_doubled_beat_puts_notes_on_every_other_beat_and_doubles_the_meter():
+    beats = _accelerating_beats()
+    midi = notes_to_midi(
+        _on_beats(beats),
+        beat_grid=_rubato_grid(beats),
+        options=ExportOptions(beat_scale=2),
+    )
+    two = 2 * midi.ticks_per_beat
+    assert all(_off_grid_ticks(t, two) <= 2 * SLACK for t in _note_ticks(midi))
+    assert _metas(midi, "time_signature")[0].numerator == 8
+
+
+def test_a_halved_beat_puts_notes_between_beats_and_halves_the_meter():
+    beats = _accelerating_beats()
+    midi = notes_to_midi(
+        _on_beats(beats),
+        beat_grid=_rubato_grid(beats),
+        options=ExportOptions(beat_scale=0.5),
+    )
+    # The beats dropped from the tempo map were not quite halfway between the
+    # ones kept, the tempo being on the move; they still land close to it.
+    half = midi.ticks_per_beat // 2
+    assert all(_off_grid_ticks(t, half) <= SLACK // 2 + 5 for t in _note_ticks(midi))
+    assert _metas(midi, "time_signature")[0].numerator == 2
+
+
+def test_a_given_downbeat_snaps_to_the_nearest_tracked_beat():
+    beats = _accelerating_beats()
+    notes = _on_beats(beats)
+    midi = notes_to_midi(
+        notes,
+        beat_grid=_rubato_grid(beats),
+        # Just after the third beat: that beat starts a bar now.
+        options=ExportOptions(first_downbeat=float(beats[2]) + 0.03),
+    )
+    ticks = _note_ticks(midi)
+    bar = 4 * midi.ticks_per_beat
+    expected = [2 * bar // 4, 3 * bar // 4, 0, bar // 4]
+    for tick, want in zip(ticks[:4], expected):
+        assert abs((tick - want + bar // 2) % bar - bar // 2) <= SLACK
+
+
+def test_quantizing_follows_the_tempo_map():
+    beats = _accelerating_beats()
+    sixteenths = _on_beats(beats, every=0.25)
+    rng = np.random.default_rng(1)
+    jittered = [
+        dataclasses.replace(n, onset=n.onset + rng.uniform(-0.01, 0.01))
+        for n in sixteenths
+    ]
+    midi = notes_to_midi(
+        jittered,
+        beat_grid=_rubato_grid(beats),
+        options=ExportOptions(quantize=True),
+    )
+    assert all(t % (midi.ticks_per_beat // 4) == 0 for t in _note_ticks(midi))
+
+
+def test_smoothing_takes_the_trackers_frame_jitter_out_of_the_tempo():
+    """beat_this reports beats on 20 ms frames: that alone must not make a tempo map."""
+    exact = 0.3 + np.arange(64) * (60.0 / 123.0)
+    framed = np.round(exact / 0.02) * 0.02
+    midi = notes_to_midi(
+        _on_beats(framed),
+        beat_grid=_rubato_grid(framed),
+        options=ExportOptions(tempo_map=True),
+    )
+    bpms = [mido.tempo2bpm(m.tempo) for m in midi.tracks[0] if m.type == "set_tempo"]
+    assert max(bpms) - min(bpms) < 0.04 * 123
+
+
+def test_beat_scale_must_be_a_power_of_two():
+    with pytest.raises(ValueError):
+        ExportOptions(beat_scale=3)
